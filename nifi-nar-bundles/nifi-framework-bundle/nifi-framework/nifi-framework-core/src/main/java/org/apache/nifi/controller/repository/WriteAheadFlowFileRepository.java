@@ -325,7 +325,10 @@ public class WriteAheadFlowFileRepository implements FlowFileRepository, SyncLis
                     claimsToAdd.add(record.getOriginalClaim().getResourceClaim());
                 }
             }
+        }
 
+        // Once the content claim counts have been updated for all records, collect any transient claims that are eligible for destruction
+        for (final RepositoryRecord record : records) {
             final List<ContentClaim> transientClaims = record.getTransientClaims();
             if (transientClaims != null) {
                 for (final ContentClaim transientClaim : transientClaims) {

@@ -25,7 +25,7 @@ import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
-import org.apache.nifi.annotation.lifecycle.OnStopped;
+import org.apache.nifi.annotation.lifecycle.OnUnscheduled;
 import org.apache.nifi.components.AllowableValue;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.expression.ExpressionLanguageScope;
@@ -301,6 +301,7 @@ public class HandleHttpRequest extends AbstractProcessor {
     }
 
     private volatile Server server;
+    private volatile boolean ready;
     private AtomicBoolean initialized = new AtomicBoolean(false);
     private volatile BlockingQueue<HttpRequestContainer> containerQueue;
 
@@ -319,7 +320,7 @@ public class HandleHttpRequest extends AbstractProcessor {
         initialized.set(false);
     }
 
-    private synchronized void initializeServer(final ProcessContext context) throws Exception {
+    synchronized void initializeServer(final ProcessContext context) throws Exception {
         if(initialized.get()){
             return;
         }
@@ -456,6 +457,12 @@ public class HandleHttpRequest extends AbstractProcessor {
 
                     response.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE, "Processor queue is full");
                     return;
+                } else if (!ready) {
+                    getLogger().warn("Request from {} cannot be processed, processor is being shut down; responding with SERVICE_UNAVAILABLE",
+                        new Object[]{request.getRemoteAddr()});
+
+                    response.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE, "Processor is shutting down");
+                    return;
                 }
 
                 // Right now, that information, though, is only in the ProcessSession, not the ProcessContext,
@@ -486,6 +493,7 @@ public class HandleHttpRequest extends AbstractProcessor {
         getLogger().info("Server started and listening on port " + getPort());
 
         initialized.set(true);
+        ready = true;
     }
 
     protected int getPort() {
@@ -530,15 +538,47 @@ public class HandleHttpRequest extends AbstractProcessor {
         return sslFactory;
     }
 
-    @OnStopped
+    @OnUnscheduled
     public void shutdown() throws Exception {
+        ready = false;
+
         if (server != null) {
             getLogger().debug("Shutting down server");
+            rejectPendingRequests();
             server.stop();
             server.destroy();
             server.join();
             getLogger().info("Shut down {}", new Object[]{server});
         }
+    }
+
+    void rejectPendingRequests() {
+        HttpRequestContainer container;
+        while ((container = getNextContainer()) != null) {
+            try {
+                getLogger().warn("Rejecting request from {} during cleanup after processor shutdown; responding with SERVICE_UNAVAILABLE",
+                    new Object[]{container.getRequest().getRemoteAddr()});
+
+                HttpServletResponse response = container.getResponse();
+                response.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE, "Processor is shutting down");
+                container.getContext().complete();
+            } catch (final IOException e) {
+                getLogger().warn("Failed to send HTTP response to {} due to {}",
+                    new Object[]{container.getRequest().getRemoteAddr(), e});
+            }
+        }
+    }
+
+    private HttpRequestContainer getNextContainer() {
+        HttpRequestContainer container;
+        try {
+            container = containerQueue.poll(2, TimeUnit.SECONDS);
+        } catch (final InterruptedException e) {
+            getLogger().warn("Interrupted while polling for " + HttpRequestContainer.class.getSimpleName() + " during cleanup.");
+            container = null;
+        }
+
+        return container;
     }
 
     @Override
